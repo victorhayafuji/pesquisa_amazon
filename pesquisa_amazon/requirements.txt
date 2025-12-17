@@ -1,0 +1,9 @@
+# Dependências do projeto (inferidas a partir dos imports do código)
+# Core (coleta e consolidação)
+requests
+python-dotenv
+pandas
+
+# Dashboard (Streamlit)
+streamlit
+altair

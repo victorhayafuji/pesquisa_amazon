@@ -22,7 +22,7 @@ SEARCHAPI_BASE_URL = "https://www.searchapi.io/api/v1/search"
 ENGINE_AMAZON_SEARCH = "amazon_search"
 
 # Defaults (ajuste conforme seu mercado / necessidade)
-AMAZON_DOMAIN_DEFAULT = "amazon.com"   # A doc indica amazon.com como default
+AMAZON_DOMAIN_DEFAULT = "amazon.com.br"   # A doc indica amazon.com como default
 LANGUAGE_DEFAULT = "pt_BR"             # pode variar por domínio/idioma suportado
 
 # Paginação (depende do provedor; mantemos como parâmetro de projeto)
