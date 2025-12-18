@@ -1,153 +1,173 @@
-# fuzzy_matching.py
-"""Utilitários de Fuzzy Matching para normalizar e identificar marcas.
+# fuzzy_matching_marcas_conhecidas.py
+"""Fuzzy Matching de marcas baseado em referenciais/marcas_conhecidas.py.
 
-Neste projeto, a fonte oficial de marcas conhecidas é:
-- referenciais/marcas_conhecidas.py  (lista MARCAS_KNOWN)
+Regra do projeto (padrão v1.1):
+- A base oficial de marcas é a lista MARCAS_KNOWN no arquivo marcas_conhecidas.py.
+- A identificação é feita principalmente pelo TÍTULO do anúncio (campo `produto`).
+- Primeiro tenta "exact" (determinístico) e só depois fuzzy (RapidFuzz), para evitar falso positivo.
 
-A identificação de marca é feita principalmente pelo *título do anúncio* (campo `produto`).
+Regra especial (obrigatória):
+- A marca "Ou" só deve ser identificada quando houver "Ou" ou "OU" no título com a letra "O" MAIÚSCULA.
+  Se aparecer "ou" minúsculo, é separador e NÃO deve ser considerado marca.
 """
 
 from __future__ import annotations
 
 from typing import Iterable, List, Optional, Tuple, Dict
 from pathlib import Path
+import ast
 import csv
 import os
 import re
 import unicodedata
 
 try:
-    # RapidFuzz: fuzzy matching moderno e performático
-    # pip install rapidfuzz
-    from rapidfuzz import process, fuzz  # type: ignore[import]
-except ImportError:
+    from rapidfuzz import process, fuzz, utils as fuzz_utils  # type: ignore[import]
+except Exception:
     process = None  # type: ignore[assignment]
     fuzz = None  # type: ignore[assignment]
+    fuzz_utils = None  # type: ignore[assignment]
 
 
-# Base do projeto (tenta config padrão; fallback para config do Amazon)
-try:
-    from config import BASE_DIR  # type: ignore
-except Exception:  # pragma: no cover
-    from config_amazon import PROJETO_DIR as BASE_DIR
-
-
-def _dir_referenciais() -> Path:
-    """Retorna um diretório de referenciais gravável.
-
-    Em alguns ambientes (como sandbox), a pasta `referenciais/` pode não estar gravável.
-    Neste caso, usamos `referenciais_local/` como fallback.
-    """
-    preferido = BASE_DIR / "referenciais"
-    if preferido.exists() and os.access(preferido, os.W_OK):
-        return preferido
-
-    # tenta criar e usar o preferido
+def _base_dir() -> Path:
+    """Base do projeto (prioriza config_amazon.PROJETO_DIR; fallback para pasta do arquivo)."""
     try:
-        preferido.mkdir(parents=True, exist_ok=True)
-        if os.access(preferido, os.W_OK):
-            return preferido
+        from config_amazon import PROJETO_DIR  # type: ignore
+        return Path(PROJETO_DIR)
     except Exception:
-        pass
-
-    fallback = BASE_DIR / "referenciais_local"
-    fallback.mkdir(parents=True, exist_ok=True)
-    return fallback
+        return Path(__file__).resolve().parent
 
 
-REFERENCIAIS_DIR = _dir_referenciais()
-
+BASE_DIR = _base_dir()
+REFERENCIAIS_DIR = BASE_DIR / "referenciais"
 MARCAS_CONHECIDAS_PY = "marcas_conhecidas.py"
 TITULOS_SEM_MARCA_CSV = REFERENCIAIS_DIR / "titulos_sem_marca.csv"
 
-# Deduplicação em memória (por execução)
+# cache simples para não escrever o mesmo título várias vezes na mesma execução
 _TITULOS_SEM_MARCA_SESSAO: set[str] = set()
 
+# --- Normalização básica (conservadora) ---
 
 def _remover_acentos(texto: str) -> str:
-    return "".join(c for c in unicodedata.normalize("NFKD", texto) if not unicodedata.combining(c))
+    texto_nfkd = unicodedata.normalize("NFKD", texto)
+    return "".join(ch for ch in texto_nfkd if not unicodedata.combining(ch))
 
 
 def normalizar_texto(texto: str) -> str:
-    """Normaliza texto para matching:
+    """Normaliza para matching:
     - remove acentos
-    - upper
-    - remove pontuação (vira espaço)
+    - deixa em MAIÚSCULO
+    - troca qualquer coisa que não seja A-Z/0-9 por espaço
     - colapsa espaços
     """
-    t = _remover_acentos(texto or "").upper()
+    t = _remover_acentos(texto or "")
+    t = t.upper()
     t = re.sub(r"[^A-Z0-9]+", " ", t)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 
-def _extrair_strings_de_python(py_text: str) -> List[str]:
-    """Extrai *todas* as strings literais do arquivo .py.
+# --- Carregamento de marcas conhecidas ---
 
-    Isto é propositalmente mais robusto do que `import marcas_conhecidas`,
-    porque evita problemas de sintaxe/concatenação de strings por falta de vírgula.
-    """
-    # captura "..." e '...'
-    strings = []
+def _extrair_marcas_via_ast(py_text: str) -> Optional[List[str]]:
+    """Tenta extrair MARCAS_KNOWN via AST (mais seguro quando o arquivo é Python válido)."""
+    try:
+        tree = ast.parse(py_text)
+    except Exception:
+        return None
+
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "MARCAS_KNOWN":
+                    try:
+                        marcas = ast.literal_eval(node.value)
+                        if isinstance(marcas, list):
+                            out = []
+                            for x in marcas:
+                                if x is None:
+                                    continue
+                                s = str(x).strip()
+                                if s:
+                                    out.append(s)
+                            return out
+                    except Exception:
+                        return None
+    return None
+
+
+def _extrair_strings_por_regex(py_text: str) -> List[str]:
+    """Fallback: extrai todas as strings literais do arquivo (caso o AST falhe)."""
+    strings: List[str] = []
     strings += re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', py_text)
     strings += re.findall(r"'([^'\\]*(?:\\.[^'\\]*)*)'", py_text)
-    # desfaz escapes mais comuns
-    def _unescape(s: str) -> str:
+    # limpa escapes simples
+    out = []
+    for s in strings:
         try:
-            return bytes(s, "utf-8").decode("unicode_escape")
+            out.append(bytes(s, "utf-8").decode("unicode_escape").strip())
         except Exception:
-            return s
-    return [_unescape(s) for s in strings]
+            out.append(s.strip())
+    return [s for s in out if s]
 
 
 def carregar_marcas_conhecidas() -> List[str]:
-    """Carrega lista de marcas conhecidas a partir de `marcas_conhecidas.py`.
+    """Carrega marcas conhecidas a partir de marcas_conhecidas.py.
 
     Procura em:
-    - BASE_DIR/referenciais/marcas_conhecidas.py
-    - BASE_DIR/referenciais_local/marcas_conhecidas.py
-    - BASE_DIR/marcas_conhecidas.py
-    - mesmo diretório deste arquivo
+    - referenciais/marcas_conhecidas.py
+    - ./marcas_conhecidas.py (mesma pasta do projeto)
+    - mesma pasta deste arquivo
     """
     candidatos = [
-        (BASE_DIR / "referenciais" / MARCAS_CONHECIDAS_PY),
-        (BASE_DIR / "referenciais_local" / MARCAS_CONHECIDAS_PY),
+        (REFERENCIAIS_DIR / MARCAS_CONHECIDAS_PY),
         (BASE_DIR / MARCAS_CONHECIDAS_PY),
         (Path(__file__).resolve().parent / MARCAS_CONHECIDAS_PY),
     ]
 
     for p in candidatos:
-        if p.exists():
-            try:
-                conteudo = p.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                conteudo = p.read_text(encoding="latin-1", errors="ignore")
+        if not p.exists():
+            continue
 
-            # pega strings e filtra o mínimo: remove coisas vazias e nomes de variáveis
-            brutas = [s.strip() for s in _extrair_strings_de_python(conteudo)]
-            # tenta focar no que parece marca: remove strings muito pequenas e genéricas
-            marcas = [s for s in brutas if s and len(s) >= 2]
-            # dedupe preservando ordem
-            visto = set()
-            out = []
-            for m in marcas:
-                key = m.strip()
-                if key not in visto:
-                    visto.add(key)
-                    out.append(key)
-            return out
+        try:
+            py_text = p.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            py_text = p.read_text(encoding="latin-1", errors="ignore")
+
+        marcas = _extrair_marcas_via_ast(py_text)
+        if marcas is None:
+            # fallback por regex (ainda filtra bastante)
+            marcas = _extrair_strings_por_regex(py_text)
+
+        # normaliza a lista final: remove vazios e duplica exata preservando ordem
+        visto = set()
+        out: List[str] = []
+        for m in marcas:
+            mm = (m or "").strip()
+            if not mm:
+                continue
+            if mm in visto:
+                continue
+            visto.add(mm)
+            out.append(mm)
+        return out
 
     return []
 
 
 def preparar_mapa_marcas(marcas: Iterable[str]) -> Tuple[Dict[str, str], List[str]]:
-    """Cria um mapa normalizado -> marca canônica.
+    """Cria mapa normalizado -> marca canônica, e lista de escolhas canônicas.
 
-    Critério de escolha da forma canônica quando há duplicatas:
+    Critério de canônica quando há duplicatas:
     - prefere a que contém espaço (ex.: 'EURO HOME' em vez de 'EUROHOME')
     - depois, prefere a mais longa
+
+    Regra especial:
+    - Remove "Ou"/"OU" do mapa e das escolhas, porque essa marca NÃO pode ser case-insensitive.
+      Ela é tratada por regra case-sensitive em detectar_marca_no_texto().
     """
     mapa: Dict[str, str] = {}
+
     for m in marcas:
         orig = (m or "").strip()
         if not orig:
@@ -155,40 +175,47 @@ def preparar_mapa_marcas(marcas: Iterable[str]) -> Tuple[Dict[str, str], List[st
         norm = normalizar_texto(orig)
         if not norm:
             continue
+
+        # "OU" / "Ou" fica fora do matching case-insensitive
+        if norm == "OU":
+            continue
+
         if norm not in mapa:
             mapa[norm] = orig
         else:
             atual = mapa[norm]
-            # preferir com espaços, e depois mais longo
+
             def _score(s: str) -> Tuple[int, int]:
                 return (1 if " " in s else 0, len(s))
+
             if _score(orig) > _score(atual):
                 mapa[norm] = orig
 
-    # lista canônica (valores) deduplicada preservando ordem dos norms
     canonicas = [mapa[n] for n in mapa.keys()]
     return mapa, canonicas
 
 
-def melhor_match_fuzzy(texto: str, escolhas: List[str]) -> Tuple[Optional[str], Optional[float]]:
-    """Retorna o melhor match fuzzy (mesmo que abaixo de threshold).
+# --- Matching ---
 
-    Se RapidFuzz não estiver instalado, retorna (None, None).
-    """
-    if not texto or not escolhas or process is None or fuzz is None:
+_OU_REGEX = re.compile(r"(?<![A-Za-z0-9])(?:Ou|OU)(?![A-Za-z0-9])")
+
+
+def melhor_match_fuzzy(texto: str, choices: List[str]) -> Tuple[Optional[str], Optional[float]]:
+    """Retorna (melhor_choice, score) usando RapidFuzz."""
+    if process is None or fuzz is None or fuzz_utils is None:
         return None, None
 
-    # parcial costuma funcionar melhor para "marca dentro de título grande"
-    resultado = process.extractOne(
-        query=texto,
-        choices=escolhas,
-        scorer=fuzz.partial_ratio,
-        processor=normalizar_texto,
-    )
+    if not texto or not choices:
+        return None, None
 
+    resultado = process.extractOne(
+        texto,
+        choices,
+        scorer=fuzz.WRatio,
+        processor=fuzz_utils.default_process,
+    )
     if not resultado:
         return None, None
-
     melhor, score, _ = resultado
     return melhor, float(score)
 
@@ -204,7 +231,7 @@ def detectar_marca_no_texto(
     Retorna:
     - marca_detectada (ou None)
     - score (100 em exact; score do RapidFuzz em fuzzy)
-    - metodo ('exact' | 'fuzzy' | 'sem_match' | 'rapidfuzz_off')
+    - metodo ('exact' | 'fuzzy' | 'sem_match' | 'rapidfuzz_off' | 'ou_case')
     - melhor_candidato (mesmo abaixo de threshold; útil para auditoria)
     - melhor_score
     """
@@ -212,12 +239,21 @@ def detectar_marca_no_texto(
     if not t:
         return None, None, "sem_match", None, None
 
+    # Regra especial: "Ou" só casa se tiver O maiúsculo no texto original.
+    # Isso evita confundir com "ou" (conjunção/separador).
+    if _OU_REGEX.search(t):
+        return "Ou", 100.0, "ou_case", "Ou", 100.0
+
+    # 1) exact contain (determinístico): casa por palavra/frase inteira no texto normalizado
     t_norm = normalizar_texto(t)
     if not t_norm:
         return None, None, "sem_match", None, None
 
-    # 1) exact contain (mais conservador e determinístico)
-    # escolhe o match mais "específico" (norm mais longo)
+
+    # Guarda conservadora: textos muito curtos geram falso positivo em fuzzy.
+    if len(t_norm) < 4:
+        return None, None, "sem_match", None, None
+
     alvo = f" {t_norm} "
     melhor_norm = None
     for marca_norm in mapa_norm_para_canon.keys():
@@ -228,10 +264,11 @@ def detectar_marca_no_texto(
                 melhor_norm = marca_norm
 
     if melhor_norm is not None:
-        return mapa_norm_para_canon[melhor_norm], 100.0, "exact", mapa_norm_para_canon[melhor_norm], 100.0
+        canon = mapa_norm_para_canon[melhor_norm]
+        return canon, 100.0, "exact", canon, 100.0
 
     # 2) fuzzy (quando disponível)
-    if process is None or fuzz is None:
+    if process is None or fuzz is None or fuzz_utils is None:
         return None, None, "rapidfuzz_off", None, None
 
     melhor, score = melhor_match_fuzzy(t, escolhas_canonicas)
@@ -244,12 +281,8 @@ def detectar_marca_no_texto(
     return None, None, "sem_match", melhor, score
 
 
-def registrar_titulo_sem_marca(
-    titulo: str,
-    melhor_candidato: Optional[str] = None,
-    melhor_score: Optional[float] = None,
-) -> None:
-    """Registra títulos sem marca identificada para revisão/curadoria."""
+def registrar_titulo_sem_marca(titulo: str, melhor_candidato: Optional[str], melhor_score: Optional[float]) -> None:
+    """Registra títulos que ficaram sem marca para curadoria."""
     t = (titulo or "").strip()
     if not t:
         return

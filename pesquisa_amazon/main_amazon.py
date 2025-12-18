@@ -22,7 +22,8 @@ import pandas as pd
 from config_amazon import OUTPUT_DIR, N_PAGINAS_DEFAULT, AMAZON_DOMAIN_DEFAULT, LANGUAGE_DEFAULT
 from amazon_search_client import buscar_amazon_search, AmazonSearchError
 from processador_resultados_amazon import extrair_resultados_amazon, resumo_schema
-from fuzzy_matching import carregar_marcas_conhecidas, preparar_mapa_marcas, detectar_marca_no_texto, registrar_titulo_sem_marca
+# Fuzzy Matching de marcas (base: marcas_conhecidas.py)
+# OBS: importado dentro de _aplicar_match_marcas para reduzir acoplamento.
 
 
 # Auditoria (RAW JSON) — DESLIGADO POR PADRÃO
@@ -45,65 +46,68 @@ def _deduplicar(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates(subset=cols, keep="first") if cols else df
 
 
-def _aplicar_fuzzy_marcas(df: pd.DataFrame, threshold: float = 88.0) -> pd.DataFrame:
-    """Identifica e normaliza marcas via fuzzy matching (padrão v1.1 do Google Search),
-    usando `marcas_conhecidas.py` (lista MARCAS_KNOWN) e o *título do anúncio*.
+def _aplicar_match_marcas(df: pd.DataFrame, threshold: float = 88.0) -> pd.DataFrame:
+    """Identifica e normaliza marcas via base `marcas_conhecidas.py` (padrão v1.1).
 
-    Prioridade de identificação:
-    1) `marca_raw` (quando vier do schema da API)
-    2) `produto` (título do anúncio)
+    Regras:
+    - Tenta identificar marca a partir do TÍTULO (coluna `produto`).
+    - Se não encontrar, tenta a partir de `marca_raw` (quando existir no schema).
+    - Gera:
+      * marca_canonica
+      * marca_score
+      * marca_metodo
+    - Registra títulos sem marca em referenciais/titulos_sem_marca.csv.
 
-    Saídas adicionadas ao DataFrame:
-    - marca_canonica: marca identificada (ou None)
-    - marca_score: score (100 em exact; score do RapidFuzz em fuzzy)
-    - marca_metodo: raw_exact | raw_fuzzy | titulo_exact | titulo_fuzzy | sem_match | rapidfuzz_off | sem_base
-    - Observação: quando não houver match, registramos o título em referenciais/titulos_sem_marca.csv
-      para curadoria (adicionar marcas novas em marcas_conhecidas.py).
+    Regra especial:
+    - A marca "Ou" só é identificada se o título contiver "Ou" ou "OU" com o "O" maiúsculo.
+      "ou" minúsculo é separador e não deve virar marca.
     """
-    if ("produto" not in df.columns) and ("marca_raw" not in df.columns):
+    from fuzzy_matching import (
+        carregar_marcas_conhecidas,
+        preparar_mapa_marcas,
+        detectar_marca_no_texto,
+        registrar_titulo_sem_marca,
+    )
+
+    if df.empty:
         return df
+
+    # garante colunas de saída
+    for col in ("marca_canonica", "marca_score", "marca_metodo"):
+        if col not in df.columns:
+            df[col] = None
 
     marcas = carregar_marcas_conhecidas()
     if not marcas:
-        df["marca_canonica"] = None
-        df["marca_score"] = None
         df["marca_metodo"] = "sem_base"
-        print("Aviso: marcas_conhecidas.py não encontrado ou lista vazia. Colunas de marca ficarão vazias.")
         return df
 
     mapa_norm, escolhas = preparar_mapa_marcas(marcas)
+    if not mapa_norm and not escolhas:
+        df["marca_metodo"] = "sem_base"
+        return df
 
-    def _resolver(row: pd.Series):
-        raw = row.get("marca_raw", None)
+    def _detectar_linha(row: pd.Series) -> Tuple[Optional[str], Optional[float], str]:
         titulo = row.get("produto", None)
+        marca_raw = row.get("marca_raw", None)
 
-        # 1) tenta pela marca retornada pela API
-        marca_raw, score_raw, metodo_raw, best_raw, best_score_raw = detectar_marca_no_texto(
-            str(raw) if raw is not None else None,
-            mapa_norm_para_canon=mapa_norm,
-            escolhas_canonicas=escolhas,
-            threshold=threshold,
-        )
-        if marca_raw:
-            return marca_raw, score_raw, f"raw_{metodo_raw}"
+        m1, s1, met1, cand1, sc1 = detectar_marca_no_texto(titulo, mapa_norm, escolhas, threshold=threshold)
+        if m1:
+            return m1, s1, f"titulo_{met1}"
 
-        # 2) tenta pelo título do anúncio
-        marca_tit, score_tit, metodo_tit, best_tit, best_score_tit = detectar_marca_no_texto(
-            str(titulo) if titulo is not None else None,
-            mapa_norm_para_canon=mapa_norm,
-            escolhas_canonicas=escolhas,
-            threshold=threshold,
-        )
-        if marca_tit:
-            return marca_tit, score_tit, f"titulo_{metodo_tit}"
+        m2, s2, met2, cand2, sc2 = detectar_marca_no_texto(marca_raw, mapa_norm, escolhas, threshold=threshold)
+        if m2:
+            return m2, s2, f"raw_{met2}"
 
-        # 3) sem match: registra para revisão
-        if titulo:
-            registrar_titulo_sem_marca(str(titulo), melhor_candidato=best_tit, melhor_score=best_score_tit)
+        # curadoria: registra o título (usa melhor candidato disponível)
+        melhor_cand = cand1 or cand2
+        melhor_score = sc1 if sc1 is not None else sc2
+        registrar_titulo_sem_marca(str(titulo or "").strip(), melhor_cand, melhor_score)
+        return None, None, "sem_match"
 
-        return None, None, metodo_tit
-
-    df[["marca_canonica", "marca_score", "marca_metodo"]] = df.apply(_resolver, axis=1, result_type="expand")
+    res = df.apply(_detectar_linha, axis=1, result_type="expand")
+    res.columns = ["marca_canonica", "marca_score", "marca_metodo"]
+    df[["marca_canonica", "marca_score", "marca_metodo"]] = res
     return df
 
 def main() -> None:
@@ -172,7 +176,7 @@ def main() -> None:
     df = _deduplicar(df)
     total_unicos = len(df)
 
-    df = _aplicar_fuzzy_marcas(df)
+    df = _aplicar_match_marcas(df)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_csv = OUTPUT_DIR / f"resultado_amazon_{slug}_{timestamp}.csv"
