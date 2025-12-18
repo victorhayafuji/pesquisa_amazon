@@ -1,302 +1,311 @@
-# fuzzy_matching_marcas_conhecidas.py
-"""Fuzzy Matching de marcas baseado em referenciais/marcas_conhecidas.py.
+# fuzzy_matching.py
+"""
+Identificação de marca (determinístico + fuzzy) usando a lista oficial em marcas_conhecidas.py.
 
-Regra do projeto (padrão v1.1):
-- A base oficial de marcas é a lista MARCAS_KNOWN no arquivo marcas_conhecidas.py.
-- A identificação é feita principalmente pelo TÍTULO do anúncio (campo `produto`).
-- Primeiro tenta "exact" (determinístico) e só depois fuzzy (RapidFuzz), para evitar falso positivo.
+Regras do projeto (tradicionais / conservadoras):
+- Primeiro tenta achar a marca por "contém" no título (match exato de palavras), pois é auditável.
+- Só usa fuzzy matching como fallback.
+- Marca "Ou": só é considerada marca se estiver com 'O' maiúsculo no título ("Ou" ou "OU").
+  Se aparecer como "ou" minúsculo, é separador e NÃO deve virar marca.
 
-Regra especial (obrigatória):
-- A marca "Ou" só deve ser identificada quando houver "Ou" ou "OU" no título com a letra "O" MAIÚSCULA.
-  Se aparecer "ou" minúsculo, é separador e NÃO deve ser considerado marca.
+Dependências:
+- Fuzzy é opcional. Se RapidFuzz não estiver instalado, roda apenas o match determinístico.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Tuple, Dict
+from dataclasses import dataclass
 from pathlib import Path
-import ast
-import csv
-import os
+from typing import Iterable, Optional, Tuple, List, Dict
 import re
 import unicodedata
 
 try:
-    from rapidfuzz import process, fuzz, utils as fuzz_utils  # type: ignore[import]
-except Exception:
-    process = None  # type: ignore[assignment]
-    fuzz = None  # type: ignore[assignment]
-    fuzz_utils = None  # type: ignore[assignment]
+    from rapidfuzz import process, fuzz  # type: ignore
+except Exception:  # pragma: no cover
+    process = None  # type: ignore
+    fuzz = None  # type: ignore
 
 
-def _base_dir() -> Path:
-    """Base do projeto (prioriza config_amazon.PROJETO_DIR; fallback para pasta do arquivo)."""
-    try:
-        from config_amazon import PROJETO_DIR  # type: ignore
-        return Path(PROJETO_DIR)
-    except Exception:
-        return Path(__file__).resolve().parent
+def _remover_acentos(s: str) -> str:
+    return "".join(c for c in unicodedata.normalize("NFKD", s) if not unicodedata.combining(c))
 
 
-BASE_DIR = _base_dir()
-REFERENCIAIS_DIR = BASE_DIR / "referenciais"
-MARCAS_CONHECIDAS_PY = "marcas_conhecidas.py"
-TITULOS_SEM_MARCA_CSV = REFERENCIAIS_DIR / "titulos_sem_marca.csv"
-
-# cache simples para não escrever o mesmo título várias vezes na mesma execução
-_TITULOS_SEM_MARCA_SESSAO: set[str] = set()
-
-# --- Normalização básica (conservadora) ---
-
-def _remover_acentos(texto: str) -> str:
-    texto_nfkd = unicodedata.normalize("NFKD", texto)
-    return "".join(ch for ch in texto_nfkd if not unicodedata.combining(ch))
+def _normalizar_texto(s: str) -> str:
+    """Normaliza texto para matching (sem acento, maiúsculo, pontuação vira espaço)."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = _remover_acentos(s).upper()
+    s = re.sub(r"[^A-Z0-9]+", " ", s)  # mantém letras e números
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def normalizar_texto(texto: str) -> str:
-    """Normaliza para matching:
-    - remove acentos
-    - deixa em MAIÚSCULO
-    - troca qualquer coisa que não seja A-Z/0-9 por espaço
-    - colapsa espaços
+
+def formatar_marca_titlecase(marca: Optional[str]) -> Optional[str]:
+    """Formata marca no padrão: Primeira letra maiúscula e o restante minúsculo em cada palavra.
+
+    Observação:
+    - Mantém tokens com dígitos (ex.: '3M') como estão, para não perder significado.
+    - Preserva separadores comuns ('-', '/', '&', '+') dentro do token.
     """
-    t = _remover_acentos(texto or "")
-    t = t.upper()
-    t = re.sub(r"[^A-Z0-9]+", " ", t)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-
-# --- Carregamento de marcas conhecidas ---
-
-def _extrair_marcas_via_ast(py_text: str) -> Optional[List[str]]:
-    """Tenta extrair MARCAS_KNOWN via AST (mais seguro quando o arquivo é Python válido)."""
-    try:
-        tree = ast.parse(py_text)
-    except Exception:
+    if marca is None:
+        return None
+    s = str(marca).strip()
+    if not s:
         return None
 
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "MARCAS_KNOWN":
-                    try:
-                        marcas = ast.literal_eval(node.value)
-                        if isinstance(marcas, list):
-                            out = []
-                            for x in marcas:
-                                if x is None:
-                                    continue
-                                s = str(x).strip()
-                                if s:
-                                    out.append(s)
-                            return out
-                    except Exception:
-                        return None
+    def _fmt_piece(piece: str) -> str:
+        if not piece:
+            return piece
+        if any(ch.isdigit() for ch in piece):
+            return piece
+        if len(piece) == 1:
+            return piece.upper()
+        return piece[0].upper() + piece[1:].lower()
+
+    # Mantém espaços, formata cada "token" entre espaços
+    partes = re.split(r"(\s+)", s)
+    out: list[str] = []
+    for tok in partes:
+        if not tok:
+            continue
+        if tok.isspace():
+            out.append(tok)
+            continue
+
+        # Separa por delimitadores internos, preservando-os
+        sub = re.split(r"([\-\/&\+])", tok)
+        sub_out: list[str] = []
+        for p in sub:
+            if p in "-/&+":
+                sub_out.append(p)
+            else:
+                # Trata apóstrofo (O'Neill)
+                if "'" in p:
+                    sub_out.append("'".join(_fmt_piece(x) for x in p.split("'")))
+                else:
+                    sub_out.append(_fmt_piece(p))
+        out.append("".join(sub_out))
+
+    return "".join(out)
+def _extrair_strings_python(texto_py: str) -> List[str]:
+    """Extrai strings de um arquivo .py mesmo se houver erros de sintaxe (ex.: vírgulas faltando)."""
+    # captura "..." e '...'
+    itens = re.findall(r'(?:"([^"]+)"|\'([^\']+)\')', texto_py)
+    out: List[str] = []
+    for a, b in itens:
+        v = a or b
+        v = (v or "").strip()
+        if v:
+            out.append(v)
+    return out
+
+
+def carregar_marcas_conhecidas(caminho_marcas_py: Path) -> List[str]:
+    """Carrega a lista de marcas do arquivo marcas_conhecidas.py (robusto a pequenos erros)."""
+    texto = caminho_marcas_py.read_text(encoding="utf-8", errors="replace")
+    marcas = _extrair_strings_python(texto)
+
+    # remove vazios e duplica, preservando a primeira ocorrência
+    seen = set()
+    marcas_unicas: List[str] = []
+    for m in marcas:
+        key = _normalizar_texto(m)
+        if not key:
+            continue
+        if key not in seen:
+            seen.add(key)
+            marcas_unicas.append(m.strip())
+
+    return marcas_unicas
+
+
+def localizar_marcas_conhecidas() -> Optional[Path]:
+    """
+    Procura marcas_conhecidas.py:
+    - na pasta atual
+    - em ./referenciais/
+    - na pasta do arquivo caller (onde o script principal está)
+    """
+    candidatos = [
+        Path.cwd() / "marcas_conhecidas.py",
+        Path.cwd() / "referenciais" / "marcas_conhecidas.py",
+        Path(__file__).resolve().parent / "marcas_conhecidas.py",
+        Path(__file__).resolve().parent / "referenciais" / "marcas_conhecidas.py",
+    ]
+    for p in candidatos:
+        if p.exists():
+            return p
     return None
 
 
-def _extrair_strings_por_regex(py_text: str) -> List[str]:
-    """Fallback: extrai todas as strings literais do arquivo (caso o AST falhe)."""
-    strings: List[str] = []
-    strings += re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', py_text)
-    strings += re.findall(r"'([^'\\]*(?:\\.[^'\\]*)*)'", py_text)
-    # limpa escapes simples
-    out = []
-    for s in strings:
-        try:
-            out.append(bytes(s, "utf-8").decode("unicode_escape").strip())
-        except Exception:
-            out.append(s.strip())
-    return [s for s in out if s]
+@dataclass
+class MatchMarca:
+    marca: Optional[str]
+    score: Optional[float]
+    metodo: str
 
 
-def carregar_marcas_conhecidas() -> List[str]:
-    """Carrega marcas conhecidas a partir de marcas_conhecidas.py.
+class MarcaMatcher:
+    def __init__(self, marcas: Iterable[str], threshold: float = 88.0):
+        self.threshold = float(threshold)
 
-    Procura em:
-    - referenciais/marcas_conhecidas.py
-    - ./marcas_conhecidas.py (mesma pasta do projeto)
-    - mesma pasta deste arquivo
-    """
-    candidatos = [
-        (REFERENCIAIS_DIR / MARCAS_CONHECIDAS_PY),
-        (BASE_DIR / MARCAS_CONHECIDAS_PY),
-        (Path(__file__).resolve().parent / MARCAS_CONHECIDAS_PY),
-    ]
+        # separa "OU" para tratamento especial
+        self._tem_ou = any(_normalizar_texto(m) == "OU" for m in marcas)
 
-    for p in candidatos:
-        if not p.exists():
-            continue
-
-        try:
-            py_text = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            py_text = p.read_text(encoding="latin-1", errors="ignore")
-
-        marcas = _extrair_marcas_via_ast(py_text)
-        if marcas is None:
-            # fallback por regex (ainda filtra bastante)
-            marcas = _extrair_strings_por_regex(py_text)
-
-        # normaliza a lista final: remove vazios e duplica exata preservando ordem
-        visto = set()
-        out: List[str] = []
+        # prepara lista (exceto OU) para match
+        prepped: List[Tuple[str, str]] = []
         for m in marcas:
-            mm = (m or "").strip()
-            if not mm:
+            norm = _normalizar_texto(m)
+            if not norm:
                 continue
-            if mm in visto:
+            if norm == "OU":
                 continue
-            visto.add(mm)
-            out.append(mm)
-        return out
+            prepped.append((m, norm))
 
-    return []
+        # ordena por tamanho desc para evitar "marca curta" ganhar de "marca longa"
+        prepped.sort(key=lambda t: len(t[1]), reverse=True)
+        self._prepped = prepped
+
+        # choices para fuzzy (evita marcas curtíssimas sem dígitos)
+        self._choices_fuzzy: List[Tuple[str, str]] = []
+        for orig, norm in self._prepped:
+            if len(norm) >= 4 or any(ch.isdigit() for ch in norm):
+                self._choices_fuzzy.append((orig, norm))
+
+        self._norm_to_orig: Dict[str, str] = {norm: orig for orig, norm in self._choices_fuzzy}
+
+    def _match_ou_especial(self, titulo_original: str) -> bool:
+        """
+        Marca 'Ou' só é válida se o título tiver 'Ou' ou 'OU' com O maiúsculo.
+        Não pode bater em 'ou' minúsculo.
+        """
+        if not self._tem_ou:
+            return False
+        if not titulo_original:
+            return False
+        # palavra isolada, O precisa ser maiúsculo e U pode ser maiúsculo ou minúsculo
+        return bool(re.search(r"(?<![A-Za-zÀ-ÖØ-öø-ÿ0-9])O[uU](?![A-Za-zÀ-ÖØ-öø-ÿ0-9])", titulo_original))
+
+    def _match_exato(self, texto: str) -> Optional[str]:
+        """Match exato (contém) em texto normalizado."""
+        t_norm = _normalizar_texto(texto)
+        if not t_norm:
+            return None
+
+        padded = f" {t_norm} "
+        for orig, m_norm in self._prepped:
+            if f" {m_norm} " in padded:
+                return orig
+        return None
+
+    def _match_fuzzy(self, texto: str) -> Optional[Tuple[str, float]]:
+        """Fuzzy matching: retorna (marca, score) ou None."""
+        if process is None or fuzz is None:
+            return None
+        t_norm = _normalizar_texto(texto)
+        if not t_norm:
+            return None
+        if not self._choices_fuzzy:
+            return None
+
+        choices_norm = [n for _, n in self._choices_fuzzy]
+        res = process.extractOne(t_norm, choices_norm, scorer=fuzz.WRatio)
+        if not res:
+            return None
+        best_norm, score, _ = res
+        if score >= self.threshold:
+            return (self._norm_to_orig.get(best_norm, best_norm), float(score))
+        return None
+
+    def match(self, titulo: str, marca_raw: Optional[str] = None) -> MatchMarca:
+        """
+        Ordem:
+        1) OU especial no título (case-sensitive)
+        2) Exato no título
+        3) Exato no marca_raw
+        4) Fuzzy no marca_raw
+        5) Fuzzy no título
+        """
+        titulo = titulo or ""
+        if self._match_ou_especial(titulo):
+            return MatchMarca("Ou", 100.0, "titulo_exact_ou")
+
+        m = self._match_exato(titulo)
+        if m:
+            return MatchMarca(m, 100.0, "titulo_exact")
+
+        if marca_raw:
+            if self._match_ou_especial(marca_raw):
+                return MatchMarca("Ou", 100.0, "raw_exact_ou")
+
+            m2 = self._match_exato(marca_raw)
+            if m2:
+                return MatchMarca(m2, 100.0, "raw_exact")
+
+            mf = self._match_fuzzy(marca_raw)
+            if mf:
+                return MatchMarca(mf[0], mf[1], "raw_fuzzy")
+
+        mf2 = self._match_fuzzy(titulo)
+        if mf2:
+            return MatchMarca(mf2[0], mf2[1], "titulo_fuzzy")
+
+        return MatchMarca(None, None, "sem_match")
 
 
-def preparar_mapa_marcas(marcas: Iterable[str]) -> Tuple[Dict[str, str], List[str]]:
-    """Cria mapa normalizado -> marca canônica, e lista de escolhas canônicas.
-
-    Critério de canônica quando há duplicatas:
-    - prefere a que contém espaço (ex.: 'EURO HOME' em vez de 'EUROHOME')
-    - depois, prefere a mais longa
-
-    Regra especial:
-    - Remove "Ou"/"OU" do mapa e das escolhas, porque essa marca NÃO pode ser case-insensitive.
-      Ela é tratada por regra case-sensitive em detectar_marca_no_texto().
+def aplicar_matching_em_df(df, col_titulo: str = "produto", col_marca_raw: str = "marca_raw",
+                           threshold: float = 88.0, caminho_marcas: Optional[Path] = None):
     """
-    mapa: Dict[str, str] = {}
-
-    for m in marcas:
-        orig = (m or "").strip()
-        if not orig:
-            continue
-        norm = normalizar_texto(orig)
-        if not norm:
-            continue
-
-        # "OU" / "Ou" fica fora do matching case-insensitive
-        if norm == "OU":
-            continue
-
-        if norm not in mapa:
-            mapa[norm] = orig
-        else:
-            atual = mapa[norm]
-
-            def _score(s: str) -> Tuple[int, int]:
-                return (1 if " " in s else 0, len(s))
-
-            if _score(orig) > _score(atual):
-                mapa[norm] = orig
-
-    canonicas = [mapa[n] for n in mapa.keys()]
-    return mapa, canonicas
-
-
-# --- Matching ---
-
-_OU_REGEX = re.compile(r"(?<![A-Za-z0-9])(?:Ou|OU)(?![A-Za-z0-9])")
-
-
-def melhor_match_fuzzy(texto: str, choices: List[str]) -> Tuple[Optional[str], Optional[float]]:
-    """Retorna (melhor_choice, score) usando RapidFuzz."""
-    if process is None or fuzz is None or fuzz_utils is None:
-        return None, None
-
-    if not texto or not choices:
-        return None, None
-
-    resultado = process.extractOne(
-        texto,
-        choices,
-        scorer=fuzz.WRatio,
-        processor=fuzz_utils.default_process,
-    )
-    if not resultado:
-        return None, None
-    melhor, score, _ = resultado
-    return melhor, float(score)
-
-
-def detectar_marca_no_texto(
-    texto: Optional[str],
-    mapa_norm_para_canon: Dict[str, str],
-    escolhas_canonicas: List[str],
-    threshold: float = 88.0,
-) -> Tuple[Optional[str], Optional[float], Optional[str], Optional[str], Optional[float]]:
-    """Detecta marca conhecida dentro de um texto (título ou marca_raw).
-
-    Retorna:
-    - marca_detectada (ou None)
-    - score (100 em exact; score do RapidFuzz em fuzzy)
-    - metodo ('exact' | 'fuzzy' | 'sem_match' | 'rapidfuzz_off' | 'ou_case')
-    - melhor_candidato (mesmo abaixo de threshold; útil para auditoria)
-    - melhor_score
+    Adiciona colunas:
+    - marca_canonica
+    - marca_score
+    - marca_metodo
     """
-    t = (texto or "").strip()
-    if not t:
-        return None, None, "sem_match", None, None
+    if caminho_marcas is None:
+        caminho_marcas = localizar_marcas_conhecidas()
 
-    # Regra especial: "Ou" só casa se tiver O maiúsculo no texto original.
-    # Isso evita confundir com "ou" (conjunção/separador).
-    if _OU_REGEX.search(t):
-        return "Ou", 100.0, "ou_case", "Ou", 100.0
+    if caminho_marcas is None or not caminho_marcas.exists():
+        # não quebra o pipeline: só adiciona colunas vazias
+        df["marca_canonica"] = None
+        df["marca_score"] = None
+        df["marca_metodo"] = "marcas_conhecidas_nao_encontrado"
+        return df
 
-    # 1) exact contain (determinístico): casa por palavra/frase inteira no texto normalizado
-    t_norm = normalizar_texto(t)
-    if not t_norm:
-        return None, None, "sem_match", None, None
+    marcas = carregar_marcas_conhecidas(caminho_marcas)
+    matcher = MarcaMatcher(marcas, threshold=threshold)
 
+    tit = df[col_titulo] if col_titulo in df.columns else None
+    raw = df[col_marca_raw] if col_marca_raw in df.columns else None
 
-    # Guarda conservadora: textos muito curtos geram falso positivo em fuzzy.
-    if len(t_norm) < 4:
-        return None, None, "sem_match", None, None
+    marcas_out: List[Optional[str]] = []
+    scores_out: List[Optional[float]] = []
+    metodos_out: List[str] = []
 
-    alvo = f" {t_norm} "
-    melhor_norm = None
-    for marca_norm in mapa_norm_para_canon.keys():
-        if not marca_norm:
-            continue
-        if f" {marca_norm} " in alvo:
-            if melhor_norm is None or len(marca_norm) > len(melhor_norm):
-                melhor_norm = marca_norm
+    if tit is None:
+        # sem título, tenta com marca_raw
+        for i in range(len(df)):
+            marca_raw = str(raw.iloc[i]) if raw is not None and raw.iloc[i] is not None else ""
+            mm = matcher.match("", marca_raw=marca_raw)
+            marcas_out.append(mm.marca)
+            scores_out.append(mm.score)
+            metodos_out.append(mm.metodo)
+    else:
+        for i in range(len(df)):
+            titulo = "" if tit.iloc[i] is None else str(tit.iloc[i])
+            marca_raw = ""
+            if raw is not None and i < len(raw) and raw.iloc[i] is not None:
+                marca_raw = str(raw.iloc[i])
+            mm = matcher.match(titulo, marca_raw=marca_raw)
+            marcas_out.append(mm.marca)
+            scores_out.append(mm.score)
+            metodos_out.append(mm.metodo)
 
-    if melhor_norm is not None:
-        canon = mapa_norm_para_canon[melhor_norm]
-        return canon, 100.0, "exact", canon, 100.0
-
-    # 2) fuzzy (quando disponível)
-    if process is None or fuzz is None or fuzz_utils is None:
-        return None, None, "rapidfuzz_off", None, None
-
-    melhor, score = melhor_match_fuzzy(t, escolhas_canonicas)
-    if melhor is None or score is None:
-        return None, None, "sem_match", None, None
-
-    if score >= threshold:
-        return melhor, score, "fuzzy", melhor, score
-
-    return None, None, "sem_match", melhor, score
-
-
-def registrar_titulo_sem_marca(titulo: str, melhor_candidato: Optional[str], melhor_score: Optional[float]) -> None:
-    """Registra títulos que ficaram sem marca para curadoria."""
-    t = (titulo or "").strip()
-    if not t:
-        return
-
-    key = t.lower()
-    if key in _TITULOS_SEM_MARCA_SESSAO:
-        return
-    _TITULOS_SEM_MARCA_SESSAO.add(key)
-
-    REFERENCIAIS_DIR.mkdir(parents=True, exist_ok=True)
-    escrever_header = not TITULOS_SEM_MARCA_CSV.exists()
-
-    with TITULOS_SEM_MARCA_CSV.open("a", encoding="utf-8-sig", newline="") as f:
-        writer = csv.writer(f, delimiter=";")
-        if escrever_header:
-            writer.writerow(["titulo", "melhor_candidato", "melhor_score"])
-        writer.writerow([t, melhor_candidato or "", f"{melhor_score:.1f}" if melhor_score is not None else ""])
+    df["marca_canonica"] = marcas_out
+    # Padroniza capitalização (executivo)
+    df["marca_canonica"] = [formatar_marca_titlecase(x) for x in df["marca_canonica"]]
+    df["marca_score"] = scores_out
+    df["marca_metodo"] = metodos_out
+    return df
