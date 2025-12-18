@@ -22,6 +22,7 @@ import pandas as pd
 from config_amazon import OUTPUT_DIR, N_PAGINAS_DEFAULT, AMAZON_DOMAIN_DEFAULT, LANGUAGE_DEFAULT
 from amazon_search_client import buscar_amazon_search, AmazonSearchError
 from processador_resultados_amazon import extrair_resultados_amazon, resumo_schema
+from fuzzy_matching import carregar_marcas_conhecidas, preparar_mapa_marcas, detectar_marca_no_texto, registrar_titulo_sem_marca
 
 
 # Auditoria (RAW JSON) — DESLIGADO POR PADRÃO
@@ -43,6 +44,67 @@ def _deduplicar(df: pd.DataFrame) -> pd.DataFrame:
     cols = [c for c in ["produto", "seller", "preco"] if c in df.columns]
     return df.drop_duplicates(subset=cols, keep="first") if cols else df
 
+
+def _aplicar_fuzzy_marcas(df: pd.DataFrame, threshold: float = 88.0) -> pd.DataFrame:
+    """Identifica e normaliza marcas via fuzzy matching (padrão v1.1 do Google Search),
+    usando `marcas_conhecidas.py` (lista MARCAS_KNOWN) e o *título do anúncio*.
+
+    Prioridade de identificação:
+    1) `marca_raw` (quando vier do schema da API)
+    2) `produto` (título do anúncio)
+
+    Saídas adicionadas ao DataFrame:
+    - marca_canonica: marca identificada (ou None)
+    - marca_score: score (100 em exact; score do RapidFuzz em fuzzy)
+    - marca_metodo: raw_exact | raw_fuzzy | titulo_exact | titulo_fuzzy | sem_match | rapidfuzz_off | sem_base
+    - Observação: quando não houver match, registramos o título em referenciais/titulos_sem_marca.csv
+      para curadoria (adicionar marcas novas em marcas_conhecidas.py).
+    """
+    if ("produto" not in df.columns) and ("marca_raw" not in df.columns):
+        return df
+
+    marcas = carregar_marcas_conhecidas()
+    if not marcas:
+        df["marca_canonica"] = None
+        df["marca_score"] = None
+        df["marca_metodo"] = "sem_base"
+        print("Aviso: marcas_conhecidas.py não encontrado ou lista vazia. Colunas de marca ficarão vazias.")
+        return df
+
+    mapa_norm, escolhas = preparar_mapa_marcas(marcas)
+
+    def _resolver(row: pd.Series):
+        raw = row.get("marca_raw", None)
+        titulo = row.get("produto", None)
+
+        # 1) tenta pela marca retornada pela API
+        marca_raw, score_raw, metodo_raw, best_raw, best_score_raw = detectar_marca_no_texto(
+            str(raw) if raw is not None else None,
+            mapa_norm_para_canon=mapa_norm,
+            escolhas_canonicas=escolhas,
+            threshold=threshold,
+        )
+        if marca_raw:
+            return marca_raw, score_raw, f"raw_{metodo_raw}"
+
+        # 2) tenta pelo título do anúncio
+        marca_tit, score_tit, metodo_tit, best_tit, best_score_tit = detectar_marca_no_texto(
+            str(titulo) if titulo is not None else None,
+            mapa_norm_para_canon=mapa_norm,
+            escolhas_canonicas=escolhas,
+            threshold=threshold,
+        )
+        if marca_tit:
+            return marca_tit, score_tit, f"titulo_{metodo_tit}"
+
+        # 3) sem match: registra para revisão
+        if titulo:
+            registrar_titulo_sem_marca(str(titulo), melhor_candidato=best_tit, melhor_score=best_score_tit)
+
+        return None, None, metodo_tit
+
+    df[["marca_canonica", "marca_score", "marca_metodo"]] = df.apply(_resolver, axis=1, result_type="expand")
+    return df
 
 def main() -> None:
     print("=== Pesquisa de Mercado — Amazon (SearchAPI) ===")
@@ -109,6 +171,8 @@ def main() -> None:
     total_raw = len(df)
     df = _deduplicar(df)
     total_unicos = len(df)
+
+    df = _aplicar_fuzzy_marcas(df)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     out_csv = OUTPUT_DIR / f"resultado_amazon_{slug}_{timestamp}.csv"
